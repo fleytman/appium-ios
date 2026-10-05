@@ -9,6 +9,7 @@ import {after, before, describe, it} from 'node:test';
 import {fileURLToPath} from 'node:url';
 import {promisify} from 'node:util';
 
+import {plist} from '@appium/support';
 import {waitForCondition} from 'asyncbox';
 
 import {
@@ -145,6 +146,251 @@ async function readTCCGranted(udid: string, tccService: string, bundleId: string
       `SELECT count(*) FROM access WHERE service='${tccService}' AND client='${bundleId}' AND client_type=0 AND auth_value=2`,
     )) > 0
   );
+}
+
+/**
+ * The host-side path to a device's BulletinBoard store — the file grantPermission/revokePermission/
+ * resetPermission write the `notifications` service to.
+ */
+function bulletinBoardStorePath(udid: string): string {
+  return path.join(
+    os.homedir(),
+    'Library',
+    'Developer',
+    'CoreSimulator',
+    'Devices',
+    udid,
+    'data',
+    'Library',
+    'BulletinBoard',
+    'VersionedSectionInfo.plist',
+  );
+}
+
+/**
+ * Reads the notifications settings SpringBoard keeps for `bundleId` in its BulletinBoard store.
+ *
+ * @returns the archived `BBSectionInfoSettings` object, `undefined` if the app has no section
+ */
+async function readNotificationsSettings(udid: string, bundleId: string): Promise<Record<string, unknown> | undefined> {
+  const store = (await plist.parsePlistFile(bulletinBoardStorePath(udid))) as {
+    sectionInfo?: Record<string, Uint8Array>;
+  };
+  const section = store.sectionInfo?.[bundleId];
+  if (!section) {
+    return undefined;
+  }
+  const {$objects} = plist.parsePlist(Buffer.from(section)) as {$objects: unknown[]};
+  return $objects.find(
+    (o): o is Record<string, unknown> =>
+      typeof o === 'object' && o !== null && ('authorizationStatus' in o || 'allowsNotifications' in o),
+  );
+}
+
+/** SpringBoard's pid on the device, `undefined` while it isn't running (e.g. restarting). */
+async function springBoardPid(sim: NativeSimctl, udid: string): Promise<number | undefined> {
+  return (await sim.listProcesses(udid)).find(({name}) => name === 'com.apple.SpringBoard')?.pid;
+}
+
+/**
+ * Waits for a restarted SpringBoard to load the app's section: it's written with the legacy
+ * `allowsNotifications` flag, which SpringBoard replaces with `authorizationStatus` (1 denied,
+ * 2 authorized) only once it has loaded the section. launchd throttles back-to-back SpringBoard
+ * restarts, so this can take a while — 30s wasn't always enough on a loaded CI runner.
+ */
+async function waitForNotificationsAuthorizationStatus(udid: string, bundleId: string, status: number): Promise<void> {
+  const started = Date.now();
+  let last: Record<string, unknown> | undefined;
+  const pids: (number | undefined)[] = [];
+  let lastPidCheck = 0;
+  let fallbackRestarted = false;
+  try {
+    await waitForCondition(
+      async () => {
+        last = await readNotificationsSettings(udid, bundleId);
+        if (!fallbackRestarted && last?.authorizationStatus !== status && Date.now() - started > 30_000) {
+          fallbackRestarted = true;
+          const before = await springBoardPid(sim, udid).catch(() => -1);
+          const out = await diagRun('xcrun', ['simctl', 'spawn', udid, 'launchctl', 'stop', 'com.apple.SpringBoard']);
+          diagTrace(
+            `FALLBACK plain restart of SpringBoard ${before} after ${Date.now() - started}ms: ${out.trim() || 'ok'}`,
+          );
+        }
+        if (Date.now() - lastPidCheck > 5000) {
+          lastPidCheck = Date.now();
+          const pid = await springBoardPid(sim, udid).catch(() => -1);
+          if (pids.at(-1) !== pid) {
+            pids.push(pid);
+          }
+        }
+        return last?.authorizationStatus === status;
+      },
+      {waitMs: 90_000, intervalMs: 500},
+    );
+    diagTrace(
+      `ok ${bundleId} authorizationStatus=${status} in ${Date.now() - started}ms` +
+        `${fallbackRestarted ? ' (after FALLBACK restart)' : ''}, SpringBoard pids ${pids.join('>')}`,
+    );
+  } catch (err) {
+    diagTrace(
+      `TIMEOUT ${bundleId} authorizationStatus=${status} after ${Date.now() - started}ms; ` +
+        `last=${JSON.stringify(last && diagPick(last))}; SpringBoard pids ${pids.join('>')}`,
+    );
+    await diagDump(udid, `timeout ${bundleId}=${status}`, [bundleId]);
+    throw err;
+  }
+}
+
+// ---- CI diagnostics (temporary branch only) ----
+const DIAG_T0 = Date.now();
+
+function diagTrace(message: string): void {
+  process.stdout.write(
+    `[diag ${new Date().toISOString()} +${((Date.now() - DIAG_T0) / 1000).toFixed(1)}s] ${message}\n`,
+  );
+}
+
+function diagPick(settings: Record<string, unknown>): Record<string, unknown> {
+  const keys = ['authorizationStatus', 'allowsNotifications', 'criticalAlertSetting', 'alertType', 'pushSettings'];
+  return Object.fromEntries(keys.filter((k) => k in settings).map((k) => [k, settings[k]]));
+}
+
+async function diagRun(file: string, args: string[]): Promise<string> {
+  try {
+    const {stdout, stderr} = await execFileAsync(file, args, {timeout: 120_000, maxBuffer: 256 * 1024 * 1024});
+    return `${stdout}${stderr}`;
+  } catch (err: any) {
+    return `${file} ${args[0] ?? ''} failed: ${err?.message ?? err}\n${err?.stdout ?? ''}${err?.stderr ?? ''}`;
+  }
+}
+
+async function diagStore(udid: string, bundleIds: string[]): Promise<string> {
+  const storePath = bulletinBoardStorePath(udid);
+  const parts: string[] = [];
+  try {
+    const store = (await plist.parsePlistFile(storePath)) as {
+      sectionInfoVersionNumber?: number;
+      sectionInfo?: Record<string, Uint8Array>;
+    };
+    parts.push(`v=${store.sectionInfoVersionNumber} n=${Object.keys(store.sectionInfo ?? {}).length}`);
+    for (const bundleId of bundleIds) {
+      const settings = await readNotificationsSettings(udid, bundleId);
+      parts.push(`${bundleId}=${settings ? JSON.stringify(diagPick(settings)) : 'none'}`);
+    }
+  } catch (err: any) {
+    parts.push(`store unreadable: ${err?.message ?? err}`);
+  }
+  return parts.join(' ');
+}
+
+let diagWatcher: NodeJS.Timeout | undefined;
+
+function diagWatchStore(udid: string): void {
+  const storePath = bulletinBoardStorePath(udid);
+  let previous = '';
+  diagWatcher = setInterval(() => {
+    void (async () => {
+      const stat = await fs.promises.stat(storePath).catch(() => undefined);
+      const key = stat ? `ino=${stat.ino} mtime=${stat.mtime.toISOString()} size=${stat.size}` : 'missing';
+      if (key !== previous) {
+        previous = key;
+        diagTrace(`STORE ${key}; ${await diagStore(udid, ['com.apple.mobilesafari', 'com.apple.Maps'])}`);
+      }
+    })();
+  }, 250);
+}
+
+function diagUnwatchStore(): void {
+  clearInterval(diagWatcher);
+}
+
+const DIAG_DIR = path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'coresim-diag');
+let diagDumpCount = 0;
+
+async function diagDump(udid: string, label: string, bundleIds: string[]): Promise<void> {
+  const tag = `${String(++diagDumpCount).padStart(2, '0')}-${label.replace(/[^\w.-]+/g, '_')}`;
+  await fs.promises.mkdir(DIAG_DIR, {recursive: true});
+  diagTrace(`==== DUMP ${label} -> ${DIAG_DIR}/${tag}.*`);
+  diagTrace(`store: ${await diagStore(udid, bundleIds)}`);
+  await fs.promises
+    .copyFile(bulletinBoardStorePath(udid), path.join(DIAG_DIR, `${tag}.VersionedSectionInfo.plist`))
+    .catch(() => {});
+  diagTrace(`BulletinBoard dir:\n${await diagRun('ls', ['-laOT', path.dirname(bulletinBoardStorePath(udid))])}`);
+  diagTrace(`SpringBoard pid now: ${await springBoardPid(sim, udid).catch((e) => `error ${e?.message}`)}`);
+  const launchctl = await diagRun('xcrun', ['simctl', 'spawn', udid, 'launchctl', 'list', 'com.apple.SpringBoard']);
+  diagTrace(
+    `launchctl list SpringBoard: ${launchctl
+      .split('\n')
+      .filter((l) => /"(PID|LastExitStatus)"/.test(l))
+      .join(' ')}`,
+  );
+  const log = await diagRun('xcrun', [
+    'simctl',
+    'spawn',
+    udid,
+    'log',
+    'show',
+    '--last',
+    '8m',
+    '--style',
+    'compact',
+    '--predicate',
+    'process == "SpringBoard" OR process == "launchd_sim"',
+  ]);
+  await fs.promises.writeFile(path.join(DIAG_DIR, `${tag}.log-show.txt`), log);
+  const interesting = log
+    .split('\n')
+    .filter((line) =>
+      /mobilesafari|com\.apple\.Maps|VersionedSectionInfo|SectionInfo\.plist|sectionInfo|exited|throttl|respawn|Service only ran|SIGTERM|SIGKILL|crash/i.test(
+        line,
+      ),
+    );
+  diagTrace(
+    `log show: ${log.split('\n').length} lines (saved), ${interesting.length} matching; last 150:\n${interesting.slice(-150).join('\n')}`,
+  );
+  const reportsDir = path.join(os.homedir(), 'Library', 'Logs', 'DiagnosticReports');
+  const reports = await fs.promises.readdir(reportsDir).catch(() => [] as string[]);
+  const recent: string[] = [];
+  for (const name of reports.filter((n) => /SpringBoard|launchd_sim|BulletinBoard/i.test(n))) {
+    const stat = await fs.promises.stat(path.join(reportsDir, name)).catch(() => undefined);
+    if (stat && stat.mtimeMs >= DIAG_T0) {
+      recent.push(name);
+      await fs.promises.copyFile(path.join(reportsDir, name), path.join(DIAG_DIR, `${tag}.${name}`)).catch(() => {});
+    }
+  }
+  diagTrace(`crash reports since start: ${recent.length ? recent.join(', ') : 'none'}`);
+}
+
+async function diagWaitForSpringBoard(udid: string, label: string): Promise<void> {
+  const started = Date.now();
+  try {
+    await waitForCondition(async () => Number.isInteger(await springBoardPid(sim, udid)), {
+      waitMs: 90_000,
+      intervalMs: 500,
+    });
+    diagTrace(`ok SpringBoard running (${label}) pid ${await springBoardPid(sim, udid)} in ${Date.now() - started}ms`);
+  } catch (err) {
+    diagTrace(`TIMEOUT SpringBoard running (${label}) after ${Date.now() - started}ms`);
+    await diagDump(udid, `timeout SpringBoard (${label})`, ['com.apple.mobilesafari', 'com.apple.Maps']);
+    throw err;
+  }
+}
+
+async function diagStep<T>(udid: string, label: string, step: () => Promise<T>): Promise<T> {
+  const started = Date.now();
+  diagTrace(
+    `> ${label}; SpringBoard pid ${await springBoardPid(sim, udid).catch(() => -1)}; ${await diagStore(udid, ['com.apple.mobilesafari', 'com.apple.Maps'])}`,
+  );
+  try {
+    const result = await step();
+    diagTrace(
+      `< ${label} in ${Date.now() - started}ms; ${await diagStore(udid, ['com.apple.mobilesafari', 'com.apple.Maps'])}`,
+    );
+    return result;
+  } catch (err: any) {
+    diagTrace(`! ${label} failed after ${Date.now() - started}ms: ${err?.message ?? err}`);
+    throw err;
+  }
 }
 
 /** The host-side path to a device's own copy of backboardd's preference file (see sim_orientation.mm). */
@@ -552,6 +798,134 @@ describe('NativeSimctl integration', () => {
           () => sim.grantPermission(device!.udid, 'camera', bundleId, 'limited'),
           /'limited' is only a valid status for the 'photos' service/,
         );
+      });
+
+      it('grants, revokes, and resets notifications, picked up by a restarted SpringBoard', async () => {
+        // A preinstalled app, so that SpringBoard keeps its section.
+        const bundleId = 'com.apple.mobilesafari';
+        const udid = device!.udid;
+        diagWatchStore(udid);
+
+        await diagStep(udid, 'T1 reset', () => sim.resetPermission(udid, 'notifications', bundleId));
+        assert.strictEqual(await readNotificationsSettings(udid, bundleId), undefined);
+        await diagWaitForSpringBoard(udid, 'T1 after reset');
+        const initialSpringBoardPid = await springBoardPid(sim, udid);
+
+        await diagStep(udid, 'T1 grant', () => sim.grantPermission(udid, 'notifications', bundleId));
+        await waitForNotificationsAuthorizationStatus(udid, bundleId, 2);
+        const newSpringBoardPid = await springBoardPid(sim, udid);
+        assert.ok(Number.isInteger(newSpringBoardPid));
+        assert.notStrictEqual(newSpringBoardPid, initialSpringBoardPid);
+
+        await diagStep(udid, 'T1 revoke', () => sim.revokePermission(udid, 'notifications', bundleId));
+        await waitForNotificationsAuthorizationStatus(udid, bundleId, 1);
+
+        await diagStep(udid, 'T1 grant critical', () =>
+          sim.grantPermission(udid, 'notifications', bundleId, 'critical'),
+        );
+        await waitForNotificationsAuthorizationStatus(udid, bundleId, 2);
+        assert.strictEqual((await readNotificationsSettings(udid, bundleId))?.criticalAlertSetting, 2);
+
+        await diagStep(udid, 'T1 reset end', () => sim.resetPermission(udid, 'notifications', bundleId));
+        assert.strictEqual(await readNotificationsSettings(udid, bundleId), undefined);
+        // Later tests talk to SpringBoard, so let the last restart settle.
+        await diagWaitForSpringBoard(udid, 'T1 end');
+      });
+
+      it('keeps the notifications of two apps changed concurrently', async () => {
+        // Preinstalled apps that SpringBoard keeps a written section for, but has none for by default
+        // — so a lost write can't be masked by a default section.
+        const bundleIds = ['com.apple.mobilesafari', 'com.apple.Maps'];
+        const udid = device!.udid;
+
+        await diagStep(udid, 'T2 reset both', () =>
+          Promise.all(bundleIds.map((bundleId) => sim.resetPermission(udid, 'notifications', bundleId))),
+        );
+        for (const bundleId of bundleIds) {
+          assert.strictEqual(await readNotificationsSettings(udid, bundleId), undefined);
+        }
+
+        await diagStep(udid, 'T2 grant both', () =>
+          Promise.all(bundleIds.map((bundleId) => sim.grantPermission(udid, 'notifications', bundleId))),
+        );
+        for (const bundleId of bundleIds) {
+          await waitForNotificationsAuthorizationStatus(udid, bundleId, 2);
+        }
+
+        await diagStep(udid, 'T2 reset both end', () =>
+          Promise.all(bundleIds.map((bundleId) => sim.resetPermission(udid, 'notifications', bundleId))),
+        );
+        for (const bundleId of bundleIds) {
+          assert.strictEqual(await readNotificationsSettings(udid, bundleId), undefined);
+        }
+        // Later tests talk to SpringBoard, so let the last restart settle.
+        await diagWaitForSpringBoard(udid, 'T2 end');
+        await diagDump(udid, 'T2 end (baseline)', bundleIds);
+        diagUnwatchStore();
+      });
+
+      it('writes notifications of a never-booted device to a newly created store', async () => {
+        // Cheap to create (no boot involved), like the device of the waitForBoot test below.
+        const fresh = await sim.createDevice(
+          `coresim-test-notifications-${Date.now()}`,
+          fixture.deviceTypeIdentifier,
+          fixture.runtimeIdentifier,
+        );
+        const storePath = bulletinBoardStorePath(fresh.udid);
+        const [bundleId, otherBundleId] = ['com.apple.mobilesafari', 'com.apple.Maps'];
+        try {
+          assert.strictEqual(fs.existsSync(storePath), false);
+          // Nothing to remove, so nothing is created.
+          await sim.resetPermission(fresh.udid, 'notifications', bundleId);
+          assert.strictEqual(fs.existsSync(storePath), false);
+
+          // Both find no store; the one that runs second adds its section to the store the first created.
+          await Promise.all([
+            sim.grantPermission(fresh.udid, 'notifications', bundleId),
+            sim.grantPermission(fresh.udid, 'notifications', otherBundleId, 'critical'),
+          ]);
+          const store = (await plist.parsePlistFile(storePath)) as {
+            sectionInfoVersionNumber?: number;
+            sectionInfo?: Record<string, Uint8Array>;
+          };
+          assert.strictEqual(store.sectionInfoVersionNumber, 2);
+          assert.deepStrictEqual(Object.keys(store.sectionInfo ?? {}).sort(), [bundleId, otherBundleId].sort());
+          // No SpringBoard has loaded the sections yet, so they keep the legacy flag.
+          assert.strictEqual((await readNotificationsSettings(fresh.udid, bundleId))?.allowsNotifications, true);
+          assert.strictEqual((await readNotificationsSettings(fresh.udid, otherBundleId))?.criticalAlertSetting, 2);
+
+          // A store that can't be replaced (immutable here) is left as it was, without a temp file next to it.
+          const original = await fs.promises.readFile(storePath);
+          await execFileAsync('chflags', ['uchg', storePath]);
+          try {
+            await assert.rejects(() => sim.revokePermission(fresh.udid, 'notifications', bundleId), /EPERM/);
+          } finally {
+            await execFileAsync('chflags', ['nouchg', storePath]);
+          }
+          assert.deepStrictEqual(await fs.promises.readFile(storePath), original);
+          assert.deepStrictEqual(await fs.promises.readdir(path.dirname(storePath)), [path.basename(storePath)]);
+
+          await sim.revokePermission(fresh.udid, 'notifications', bundleId);
+          assert.strictEqual((await readNotificationsSettings(fresh.udid, bundleId))?.allowsNotifications, false);
+          await sim.resetPermission(fresh.udid, 'notifications', otherBundleId);
+          assert.strictEqual(await readNotificationsSettings(fresh.udid, otherBundleId), undefined);
+        } finally {
+          await sim.deleteDevice(fresh.udid);
+        }
+      });
+
+      it('rejects "critical" for any service but notifications, and reading the notifications status', async () => {
+        const bundleId = 'io.appium.coresim.doesnotexist';
+
+        await assert.rejects(
+          () => sim.grantPermission(device!.udid, 'camera', bundleId, 'critical'),
+          /'critical' is only a valid status for the 'notifications' service/,
+        );
+        await assert.rejects(
+          () => sim.grantPermission(device!.udid, 'notifications', bundleId, 'limited'),
+          /'limited' is only a valid status for the 'photos' service/,
+        );
+        await assert.rejects(() => sim.getPermission(device!.udid, 'notifications', bundleId), /cannot be read/);
       });
 
       it('adds media to the Photos library', async () => {
@@ -1202,7 +1576,11 @@ describe('NativeSimctl integration', () => {
                 throw err;
               }
             },
-            {waitMs: 30000, intervalMs: 2000, error: 'expected openUrl to eventually succeed once the device settled'},
+            {
+              waitMs: 30000,
+              intervalMs: 2000,
+              error: 'expected openUrl to eventually succeed once the device settled',
+            },
           );
         });
 
