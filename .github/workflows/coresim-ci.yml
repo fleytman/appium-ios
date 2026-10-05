@@ -29,22 +29,6 @@ jobs:
     with:
       upload-artifacts: false
 
-  unit-test:
-    needs:
-      - node_matrix
-      - prebuild
-    strategy:
-      fail-fast: false
-      matrix:
-        node-version: ${{ fromJSON(needs.node_matrix.outputs.versions) }}
-    uses: ./.github/workflows/coresim-shared-test.yml
-    with:
-      node-version: ${{ matrix.node-version }}
-      test-command: test:unit
-      test-name: Unit tests
-      run-cpp-format-check: true
-      run-xcodebuild-check: true
-
   integration-test:
     needs:
       - prebuild

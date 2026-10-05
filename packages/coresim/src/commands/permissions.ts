@@ -22,6 +22,11 @@ const SPRINGBOARD_RESTART_TIMEOUT_MS = 30000;
 // The last pending notifications update of each BulletinBoard store, see withStoreLock.
 const storeUpdates = new Map<string, Promise<void>>();
 
+// CI diagnostics (temporary branch only)
+function diag(message: string): void {
+  process.stdout.write(`[coresim-diag ${new Date().toISOString()}] ${message}\n`);
+}
+
 declare module '../native-simctl.js' {
   interface NativeSimctl {
     grantPermission(
@@ -186,11 +191,15 @@ async function setNotificationsAccess(
   const device = await this._findDevice(udid);
   const storePath = path.join(device.dataPath(), 'Library', 'BulletinBoard', 'VersionedSectionInfo.plist');
   await withStoreLock(storePath, async () => {
+    const t0 = Date.now();
+    diag(`${bundleId}=${status}: state ${device.state()}, store ${storePath}`);
     const springBoardPid =
       device.state() === SimDeviceState.Booted ? await pauseSpringBoard.call(this, udid) : undefined;
+    diag(`${bundleId}=${status}: paused SpringBoard ${springBoardPid} in ${Date.now() - t0}ms`);
     let written = false;
     try {
       written = await writeNotificationsSection(storePath, bundleId, status);
+      diag(`${bundleId}=${status}: written=${written} at ${Date.now() - t0}ms`);
     } finally {
       if (springBoardPid && !written) {
         sendSignal(springBoardPid, 'SIGCONT');
@@ -203,10 +212,14 @@ async function setNotificationsAccess(
     try {
       try {
         await stopSpringBoard.call(this, udid);
+        diag(`${bundleId}=${status}: launchctl stop done at ${Date.now() - t0}ms`);
       } finally {
         sendSignal(springBoardPid, 'SIGCONT');
       }
       await waitForNewSpringBoard.call(this, udid, springBoardPid);
+      diag(
+        `${bundleId}=${status}: new SpringBoard ${await findSpringBoardPid.call(this, udid).catch(() => -1)} at ${Date.now() - t0}ms`,
+      );
     } finally {
       await setImmutable(storePath, false);
     }
