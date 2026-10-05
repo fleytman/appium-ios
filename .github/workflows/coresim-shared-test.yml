@@ -136,6 +136,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: coresim-diag-${{ inputs.xcode-version || 'default' }}-${{ inputs.test-command }}
+          name: coresim-diag-${{ inputs.xcode-version || 'default' }}
           path: ${{ runner.temp }}/coresim-diag
           if-no-files-found: ignore

@@ -203,10 +203,19 @@ async function waitForNotificationsAuthorizationStatus(udid: string, bundleId: s
   let last: Record<string, unknown> | undefined;
   const pids: (number | undefined)[] = [];
   let lastPidCheck = 0;
+  let fallbackRestarted = false;
   try {
     await waitForCondition(
       async () => {
         last = await readNotificationsSettings(udid, bundleId);
+        if (!fallbackRestarted && last?.authorizationStatus !== status && Date.now() - started > 30_000) {
+          fallbackRestarted = true;
+          const before = await springBoardPid(sim, udid).catch(() => -1);
+          const out = await diagRun('xcrun', ['simctl', 'spawn', udid, 'launchctl', 'stop', 'com.apple.SpringBoard']);
+          diagTrace(
+            `FALLBACK plain restart of SpringBoard ${before} after ${Date.now() - started}ms: ${out.trim() || 'ok'}`,
+          );
+        }
         if (Date.now() - lastPidCheck > 5000) {
           lastPidCheck = Date.now();
           const pid = await springBoardPid(sim, udid).catch(() => -1);
@@ -219,7 +228,8 @@ async function waitForNotificationsAuthorizationStatus(udid: string, bundleId: s
       {waitMs: 90_000, intervalMs: 500},
     );
     diagTrace(
-      `ok ${bundleId} authorizationStatus=${status} in ${Date.now() - started}ms, SpringBoard pids ${pids.join('>')}`,
+      `ok ${bundleId} authorizationStatus=${status} in ${Date.now() - started}ms` +
+        `${fallbackRestarted ? ' (after FALLBACK restart)' : ''}, SpringBoard pids ${pids.join('>')}`,
     );
   } catch (err) {
     diagTrace(
@@ -271,6 +281,27 @@ async function diagStore(udid: string, bundleIds: string[]): Promise<string> {
     parts.push(`store unreadable: ${err?.message ?? err}`);
   }
   return parts.join(' ');
+}
+
+let diagWatcher: NodeJS.Timeout | undefined;
+
+function diagWatchStore(udid: string): void {
+  const storePath = bulletinBoardStorePath(udid);
+  let previous = '';
+  diagWatcher = setInterval(() => {
+    void (async () => {
+      const stat = await fs.promises.stat(storePath).catch(() => undefined);
+      const key = stat ? `ino=${stat.ino} mtime=${stat.mtime.toISOString()} size=${stat.size}` : 'missing';
+      if (key !== previous) {
+        previous = key;
+        diagTrace(`STORE ${key}; ${await diagStore(udid, ['com.apple.mobilesafari', 'com.apple.Maps'])}`);
+      }
+    })();
+  }, 250);
+}
+
+function diagUnwatchStore(): void {
+  clearInterval(diagWatcher);
 }
 
 const DIAG_DIR = path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'coresim-diag');
@@ -773,6 +804,7 @@ describe('NativeSimctl integration', () => {
         // A preinstalled app, so that SpringBoard keeps its section.
         const bundleId = 'com.apple.mobilesafari';
         const udid = device!.udid;
+        diagWatchStore(udid);
 
         await diagStep(udid, 'T1 reset', () => sim.resetPermission(udid, 'notifications', bundleId));
         assert.strictEqual(await readNotificationsSettings(udid, bundleId), undefined);
@@ -829,6 +861,7 @@ describe('NativeSimctl integration', () => {
         // Later tests talk to SpringBoard, so let the last restart settle.
         await diagWaitForSpringBoard(udid, 'T2 end');
         await diagDump(udid, 'T2 end (baseline)', bundleIds);
+        diagUnwatchStore();
       });
 
       it('writes notifications of a never-booted device to a newly created store', async () => {
