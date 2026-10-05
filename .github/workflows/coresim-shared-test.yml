@@ -132,3 +132,10 @@ jobs:
 
       - name: Run ${{ inputs.test-name }}
         run: npm run ${{ inputs.test-command }} --workspace packages/coresim
+      - name: Upload notifications diagnostics (temporary)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coresim-diag-${{ inputs.xcode-version || 'default' }}-${{ inputs.test-command }}
+          path: ${{ runner.temp }}/coresim-diag
+          if-no-files-found: ignore

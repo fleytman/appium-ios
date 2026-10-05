@@ -273,13 +273,25 @@ async function diagStore(udid: string, bundleIds: string[]): Promise<string> {
   return parts.join(' ');
 }
 
+const DIAG_DIR = path.join(process.env.RUNNER_TEMP ?? os.tmpdir(), 'coresim-diag');
+let diagDumpCount = 0;
+
 async function diagDump(udid: string, label: string, bundleIds: string[]): Promise<void> {
-  diagTrace(`==== DUMP ${label}`);
+  const tag = `${String(++diagDumpCount).padStart(2, '0')}-${label.replace(/[^\w.-]+/g, '_')}`;
+  await fs.promises.mkdir(DIAG_DIR, {recursive: true});
+  diagTrace(`==== DUMP ${label} -> ${DIAG_DIR}/${tag}.*`);
   diagTrace(`store: ${await diagStore(udid, bundleIds)}`);
+  await fs.promises
+    .copyFile(bulletinBoardStorePath(udid), path.join(DIAG_DIR, `${tag}.VersionedSectionInfo.plist`))
+    .catch(() => {});
   diagTrace(`BulletinBoard dir:\n${await diagRun('ls', ['-laOT', path.dirname(bulletinBoardStorePath(udid))])}`);
   diagTrace(`SpringBoard pid now: ${await springBoardPid(sim, udid).catch((e) => `error ${e?.message}`)}`);
+  const launchctl = await diagRun('xcrun', ['simctl', 'spawn', udid, 'launchctl', 'list', 'com.apple.SpringBoard']);
   diagTrace(
-    `launchctl list SpringBoard:\n${await diagRun('xcrun', ['simctl', 'spawn', udid, 'launchctl', 'list', 'com.apple.SpringBoard'])}`,
+    `launchctl list SpringBoard: ${launchctl
+      .split('\n')
+      .filter((l) => /"(PID|LastExitStatus)"/.test(l))
+      .join(' ')}`,
   );
   const log = await diagRun('xcrun', [
     'simctl',
@@ -288,21 +300,22 @@ async function diagDump(udid: string, label: string, bundleIds: string[]): Promi
     'log',
     'show',
     '--last',
-    '6m',
+    '8m',
     '--style',
     'compact',
     '--predicate',
     'process == "SpringBoard" OR process == "launchd_sim"',
   ]);
+  await fs.promises.writeFile(path.join(DIAG_DIR, `${tag}.log-show.txt`), log);
   const interesting = log
     .split('\n')
     .filter((line) =>
-      /BulletinBoard|BBServer|BBSection|SectionInfo|authoriz|SpringBoard\[|exited|throttl|respawn|crash|Terminat|launchd_sim/i.test(
+      /mobilesafari|com\.apple\.Maps|VersionedSectionInfo|SectionInfo\.plist|sectionInfo|exited|throttl|respawn|Service only ran|SIGTERM|SIGKILL|crash/i.test(
         line,
       ),
     );
   diagTrace(
-    `log show: ${log.split('\n').length} lines, ${interesting.length} interesting; last 200:\n${interesting.slice(-200).join('\n')}`,
+    `log show: ${log.split('\n').length} lines (saved), ${interesting.length} matching; last 150:\n${interesting.slice(-150).join('\n')}`,
   );
   const reportsDir = path.join(os.homedir(), 'Library', 'Logs', 'DiagnosticReports');
   const reports = await fs.promises.readdir(reportsDir).catch(() => [] as string[]);
@@ -310,14 +323,11 @@ async function diagDump(udid: string, label: string, bundleIds: string[]): Promi
   for (const name of reports.filter((n) => /SpringBoard|launchd_sim|BulletinBoard/i.test(n))) {
     const stat = await fs.promises.stat(path.join(reportsDir, name)).catch(() => undefined);
     if (stat && stat.mtimeMs >= DIAG_T0) {
-      recent.push(`${name} ${stat.mtime.toISOString()}`);
+      recent.push(name);
+      await fs.promises.copyFile(path.join(reportsDir, name), path.join(DIAG_DIR, `${tag}.${name}`)).catch(() => {});
     }
   }
   diagTrace(`crash reports since start: ${recent.length ? recent.join(', ') : 'none'}`);
-  for (const name of recent.slice(0, 2)) {
-    const text = await fs.promises.readFile(path.join(reportsDir, name.split(' ')[0]), 'utf8').catch(() => '');
-    diagTrace(`${name} head:\n${text.slice(0, 4000)}`);
-  }
 }
 
 async function diagWaitForSpringBoard(udid: string, label: string): Promise<void> {
