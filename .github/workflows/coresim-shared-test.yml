@@ -131,4 +131,11 @@ jobs:
           xcrun simctl list runtimes
 
       - name: Run ${{ inputs.test-name }}
-        run: npm run ${{ inputs.test-command }} --workspace packages/coresim
+        run: |
+          rc=0
+          for i in 1 2 3; do
+            echo "::group::attempt $i"
+            npm run ${{ inputs.test-command }} --workspace packages/coresim || { rc=1; echo "ATTEMPT $i FAILED"; }
+            echo "::endgroup::"
+          done
+          exit $rc

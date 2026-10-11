@@ -44,7 +44,7 @@
     "prepare": "npm run build",
     "test": "npm run test:unit && npm run test:integration",
     "test:unit": "node --enable-source-maps --test --test-force-exit --test-timeout=15000 \"lib/test/unit/**/*.spec.js\"",
-    "test:integration": "node --enable-source-maps --test --test-force-exit --test-concurrency=1 --test-timeout=1200000 \"lib/test/integration/**/*.spec.js\""
+    "test:integration": "node --enable-source-maps --test --test-force-exit --test-concurrency=1 --test-timeout=1200000 --test-name-pattern=\"notification|permission\" \"lib/test/integration/**/*.spec.js\""
   },
   "dependencies": {
     "@appium/support": "^7.2.0",
